@@ -137,7 +137,8 @@ cmd_recieve_cb (FpiUsbTransfer *transfer,
           fp_warn ("Received General Error %d from the sensor", (guint) err);
           fpi_ssm_mark_failed (transfer->ssm,
                                fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
-                                                         "Received general error from device"));
+                                                         "Received general error %u from device",
+                                                         (guint) err));
           //fpi_ssm_jump_to_state (transfer->ssm, fpi_ssm_get_cur_state (transfer->ssm));
           return;
         }
@@ -204,7 +205,7 @@ static void
 synaptics_cmd_run_state (FpiSsm   *ssm,
                          FpDevice *dev)
 {
-  g_autoptr(FpiUsbTransfer) transfer = NULL;
+  FpiUsbTransfer *transfer;
   FpiDeviceSynaptics *self = FPI_DEVICE_SYNAPTICS (dev);
 
   switch (fpi_ssm_get_cur_state (ssm))
@@ -218,7 +219,7 @@ synaptics_cmd_run_state (FpiSsm   *ssm,
                                    NULL,
                                    fpi_ssm_usb_transfer_cb,
                                    NULL);
-          g_clear_pointer (&self->cmd_pending_transfer, fpi_usb_transfer_unref);
+          self->cmd_pending_transfer = NULL;
         }
       else
         {
@@ -289,7 +290,6 @@ cmd_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
     }
   self->cmd_complete_on_removal = FALSE;
   g_clear_pointer (&self->cmd_complete_error, g_error_free);
-  fpi_ssm_free (ssm);
 }
 
 static void
@@ -317,7 +317,7 @@ synaptics_sensor_cmd (FpiDeviceSynaptics *self,
                       gssize              payload_len,
                       SynCmdMsgCallback   callback)
 {
-  g_autoptr(FpiUsbTransfer) transfer = NULL;
+  FpiUsbTransfer *transfer;
   guint8 real_seq_num;
   gint msg_len;
   gint res;
@@ -407,7 +407,7 @@ static gboolean
 parse_print_data (GVariant      *data,
                   guint8        *finger,
                   const guint8 **user_id,
-                  gssize        *user_id_len)
+                  gsize         *user_id_len)
 {
   g_autoptr(GVariant) user_id_var = NULL;
 
@@ -447,7 +447,7 @@ list_msg_cb (FpiDeviceSynaptics *self,
 
   if (error)
     {
-      g_clear_pointer (&self->list_result, g_ptr_array_free);
+      g_clear_pointer (&self->list_result, g_ptr_array_unref);
       fpi_device_list_complete (FP_DEVICE (self), NULL, error);
       return;
     }
@@ -468,11 +468,12 @@ list_msg_cb (FpiDeviceSynaptics *self,
       else
         {
           fp_info ("Failed to query enrolled users: %d", resp->result);
-          g_clear_pointer (&self->list_result, g_ptr_array_free);
+          g_clear_pointer (&self->list_result, g_ptr_array_unref);
           fpi_device_list_complete (FP_DEVICE (self),
                                     NULL,
                                     fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-                                                              "Failed to query enrolled users"));
+                                                              "Failed to query enrolled users: %d",
+                                                              resp->result));
         }
       break;
 
@@ -505,7 +506,7 @@ list_msg_cb (FpiDeviceSynaptics *self,
                    get_enroll_templates_resp->templates[n].user_id,
                    get_enroll_templates_resp->templates[n].finger_id);
 
-          userid = get_enroll_templates_resp->templates[n].user_id;
+          userid = (gchar *) get_enroll_templates_resp->templates[n].user_id;
 
           print = fp_print_new (FP_DEVICE (self));
           uid = g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
@@ -603,6 +604,8 @@ verify_msg_cb (FpiDeviceSynaptics *self,
                                   error);
       return;
     }
+
+  g_assert (resp != NULL);
 
   verify_resp = &resp->response.verify_resp;
 
@@ -768,7 +771,8 @@ enroll_msg_cb (FpiDeviceSynaptics *self,
             fpi_device_enroll_complete (device,
                                         NULL,
                                         fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-                                                                  "Enrollment failed"));
+                                                                  "Enrollment failed (%d)",
+                                                                  resp->result));
           }
         break;
       }
@@ -798,7 +802,7 @@ enroll (FpDevice *device)
   GVariant *uid = NULL;
   const gchar *username;
   guint finger;
-  g_autofree gchar *user_id;
+  g_autofree gchar *user_id = NULL;
   gssize user_id_len;
   g_autofree guint8 *payload = NULL;
   const GDate *date;
@@ -812,9 +816,9 @@ enroll (FpDevice *device)
   date = fp_print_get_enroll_date (print);
   if (date && g_date_valid (date))
     {
-      y = date->year;
-      m = date->month;
-      d = date->day;
+      y = g_date_get_year (date);
+      m = g_date_get_month (date);
+      d = g_date_get_day (date);
     }
   else
     {
@@ -946,7 +950,8 @@ dev_probe (FpDevice *device)
 {
   FpiDeviceSynaptics *self = FPI_DEVICE_SYNAPTICS (device);
   GUsbDevice *usb_dev;
-  FpiUsbTransfer *transfer;
+
+  g_autoptr(FpiUsbTransfer) transfer = NULL;
   FpiByteReader reader;
   GError *error = NULL;
   guint16 status;
@@ -965,10 +970,7 @@ dev_probe (FpDevice *device)
     }
 
   if (!g_usb_device_reset (fpi_device_get_usb_device (device), &error))
-    {
-      fpi_device_probe_complete (device, NULL, NULL, error);
-      return;
-    }
+    goto err_close;
 
   if (!g_usb_device_claim_interface (fpi_device_get_usb_device (device), 0, 0, &error))
     goto err_close;
@@ -980,9 +982,8 @@ dev_probe (FpDevice *device)
   transfer->buffer[0] = SENSOR_CMD_GET_VERSION;
   if (!fpi_usb_transfer_submit_sync (transfer, 1000, &error))
     goto err_close;
-  fpi_usb_transfer_unref (transfer);
 
-
+  g_clear_pointer (&transfer, fpi_usb_transfer_unref);
   transfer = fpi_usb_transfer_new (device);
   fpi_usb_transfer_fill_bulk (transfer, USB_EP_REPLY, 40);
   if (!fpi_usb_transfer_submit_sync (transfer, 1000, &error))
@@ -1035,7 +1036,6 @@ dev_probe (FpDevice *device)
   fp_dbg ("Target: %d", self->mis_version.target);
   fp_dbg ("Product: %d", self->mis_version.product);
 
-  fpi_usb_transfer_unref (transfer);
 
   /* We need at least firmware version 10.1, and for 10.1 build 2989158 */
   if (self->mis_version.version_major < 10 ||
@@ -1050,7 +1050,11 @@ dev_probe (FpDevice *device)
                self->mis_version.build_num);
 
       error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-                                        "Unsupported firmware version");
+                                        "Unsupported firmware version "
+                                        "(%d.%d with build number %d)",
+                                        self->mis_version.version_major,
+                                        self->mis_version.version_minor,
+                                        self->mis_version.build_num);
       goto err_close;
     }
 
@@ -1118,7 +1122,7 @@ fps_deinit_cb (FpiDeviceSynaptics *self,
         case BMKT_RSP_POWER_DOWN_FAIL:
           fp_info ("Failed to go to power down mode: %d", resp->result);
           error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
-                                            "Power down failed");
+                                            "Power down failed: %d", resp->result);
 
           break;
         }

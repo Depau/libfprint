@@ -1,6 +1,7 @@
 /*
  * FpDevice - A fingerprint reader device
  * Copyright (C) 2019 Benjamin Berg <bberg@redhat.com>
+ * Copyright (C) 2019 Marco Trevisan <marco.trevisan@canonical.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -242,9 +243,18 @@ fpi_device_error_new (FpDeviceError error)
  * and similar calls.
  */
 GError *
-fpi_device_retry_new_msg (FpDeviceRetry error, const gchar *msg)
+fpi_device_retry_new_msg (FpDeviceRetry device_error,
+                          const gchar  *msg,
+                          ...)
 {
-  return g_error_new_literal (FP_DEVICE_RETRY, error, msg);
+  GError *error;
+  va_list args;
+
+  va_start (args, msg);
+  error = g_error_new_valist (FP_DEVICE_RETRY, device_error, msg, args);
+  va_end (args);
+
+  return error;
 }
 
 /**
@@ -256,9 +266,18 @@ fpi_device_retry_new_msg (FpDeviceRetry error, const gchar *msg)
  * and similar calls.
  */
 GError *
-fpi_device_error_new_msg (FpDeviceError error, const gchar *msg)
+fpi_device_error_new_msg (FpDeviceError device_error,
+                          const gchar  *msg,
+                          ...)
 {
-  return g_error_new_literal (FP_DEVICE_ERROR, error, msg);
+  GError *error;
+  va_list args;
+
+  va_start (args, msg);
+  error = g_error_new_valist (FP_DEVICE_ERROR, device_error, msg, args);
+  va_end (args);
+
+  return error;
 }
 
 static gboolean
@@ -363,6 +382,7 @@ fp_device_finalize (GObject *object)
 
   g_clear_pointer (&priv->device_id, g_free);
   g_clear_pointer (&priv->device_name, g_free);
+  g_clear_object (&priv->usb_device);
 
   G_OBJECT_CLASS (fp_device_parent_class)->finalize (object);
 }
@@ -1362,23 +1382,11 @@ fp_device_list_prints_finish (FpDevice     *device,
 
 typedef struct
 {
-  GSource       source;
-  FpDevice     *device;
-  FpTimeoutFunc callback;
-  gpointer      user_data;
+  GSource   source;
+  FpDevice *device;
 } FpDeviceTimeoutSource;
 
-gboolean
-device_timeout_cb (gpointer user_data)
-{
-  FpDeviceTimeoutSource *source = user_data;
-
-  source->callback (source->device, source->user_data);
-
-  return G_SOURCE_REMOVE;
-}
-
-void
+static void
 timeout_finalize (GSource *source)
 {
   FpDeviceTimeoutSource *timeout_source = (FpDeviceTimeoutSource *) source;
@@ -1389,11 +1397,12 @@ timeout_finalize (GSource *source)
 }
 
 static gboolean
-timeout_dispatch (GSource *source, GSourceFunc callback, gpointer user_data)
+timeout_dispatch (GSource *source, GSourceFunc gsource_func, gpointer user_data)
 {
   FpDeviceTimeoutSource *timeout_source = (FpDeviceTimeoutSource *) source;
+  FpTimeoutFunc callback = (FpTimeoutFunc) gsource_func;
 
-  ((FpTimeoutFunc) callback)(timeout_source->device, user_data);
+  callback (timeout_source->device, user_data);
 
   return G_SOURCE_REMOVE;
 }
@@ -1455,7 +1464,8 @@ fpi_device_set_scan_type (FpDevice  *device,
  * @device: The #FpDevice
  * @interval: The interval in milliseconds
  * @func: The #FpTimeoutFunc to call on timeout
- * @user_data: User data to pass to the callback
+ * @user_data: (nullable): User data to pass to the callback
+ * @destroy_notify: (nullable): #GDestroyNotify for @user_data
  *
  * Register a timeout to run. Drivers should always make sure that timers are
  * cancelled when appropriate.
@@ -1463,10 +1473,11 @@ fpi_device_set_scan_type (FpDevice  *device,
  * Returns: (transfer none): A newly created and attached #GSource
  */
 GSource *
-fpi_device_add_timeout (FpDevice     *device,
-                        gint          interval,
-                        FpTimeoutFunc func,
-                        gpointer      user_data)
+fpi_device_add_timeout (FpDevice      *device,
+                        gint           interval,
+                        FpTimeoutFunc  func,
+                        gpointer       user_data,
+                        GDestroyNotify destroy_notify)
 {
   FpDevicePrivate *priv = fp_device_get_instance_private (device);
   FpDeviceTimeoutSource *source;
@@ -1474,10 +1485,9 @@ fpi_device_add_timeout (FpDevice     *device,
   source = (FpDeviceTimeoutSource *) g_source_new (&timeout_funcs,
                                                    sizeof (FpDeviceTimeoutSource));
   source->device = device;
-  source->user_data = user_data;
 
   g_source_attach (&source->source, NULL);
-  g_source_set_callback (&source->source, (GSourceFunc) func, user_data, NULL);
+  g_source_set_callback (&source->source, (GSourceFunc) func, user_data, destroy_notify);
   g_source_set_ready_time (&source->source,
                            g_source_get_time (&source->source) + interval * (guint64) 1000);
   priv->sources = g_slist_prepend (priv->sources, source);
@@ -2322,8 +2332,9 @@ fpi_device_enroll_progress (FpDevice *device,
                                 data->enroll_progress_data,
                                 error);
     }
-  if (error)
-    g_error_free (error);
+
+  g_clear_error (&error);
+  g_clear_object (&print);
 }
 
 

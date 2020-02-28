@@ -20,10 +20,10 @@
 
 #include "fpi-print.h"
 #include "fpi-image.h"
+#include "fpi-log.h"
 #include "fpi-device.h"
 
-#include "nbis/include/bozorth.h"
-#include "nbis/include/lfs.h"
+#include <nbis.h>
 
 /**
  * SECTION: fp-print
@@ -101,6 +101,7 @@ fp_print_finalize (GObject *object)
   g_clear_pointer (&self->description, g_free);
   g_clear_pointer (&self->enroll_date, g_date_free);
   g_clear_pointer (&self->data, g_variant_unref);
+  g_clear_pointer (&self->prints, g_ptr_array_unref);
 
   G_OBJECT_CLASS (fp_print_parent_class)->finalize (object);
 }
@@ -206,7 +207,7 @@ fp_print_set_property (GObject      *object,
       break;
 
     case PROP_FPI_DATA:
-      g_clear_pointer (&self->description, g_variant_unref);
+      g_clear_pointer (&self->data, g_variant_unref);
       self->data = g_value_dup_variant (value);
       break;
 
@@ -534,11 +535,8 @@ fp_print_set_enroll_date (FpPrint     *print,
 
   g_clear_pointer (&print->enroll_date, g_date_free);
   if (enroll_date)
-    {
-      /* XXX: Should use g_date_copy, but that is new in 2.56. */
-      print->enroll_date = g_date_new ();
-      *print->enroll_date = *enroll_date;
-    }
+    print->enroll_date = g_date_copy (enroll_date);
+
   g_object_notify_by_pspec (G_OBJECT (print), properties[PROP_ENROLL_DATE]);
 }
 
@@ -582,7 +580,10 @@ fpi_print_set_type (FpPrint    *print,
 
   print->type = type;
   if (print->type == FP_PRINT_NBIS)
-    print->prints = g_ptr_array_new_with_free_func (g_free);
+    {
+      g_assert_null (print->prints);
+      print->prints = g_ptr_array_new_with_free_func (g_free);
+    }
   g_object_notify_by_pspec (G_OBJECT (print), properties[PROP_FPI_TYPE]);
 }
 
@@ -921,6 +922,7 @@ fp_print_serialize (FpPrint *print,
                                                                   xyt->nrows,
                                                                   sizeof (col[0])));
           g_variant_builder_close (&nested);
+          g_free (col);
         }
 
       g_variant_builder_close (&nested);
@@ -976,6 +978,7 @@ fp_print_deserialize (const guchar *data,
   g_autoptr(FpPrint) result = NULL;
   g_autoptr(GVariant) raw_value = NULL;
   g_autoptr(GVariant) value = NULL;
+  g_autoptr(GVariant) print_data = NULL;
   guchar *aligned_data = NULL;
   GDate *date = NULL;
   guint8 finger_int8;
@@ -987,7 +990,6 @@ fp_print_deserialize (const guchar *data,
   const gchar *driver;
   const gchar *device_id;
   gboolean device_stored;
-  GVariant *print_data;
 
   g_assert (data);
   g_assert (length > 3);
@@ -1007,7 +1009,7 @@ fp_print_deserialize (const guchar *data,
   memcpy (aligned_data, data + 3, length - 3);
   raw_value = g_variant_new_from_data (FP_PRINT_VARIANT_TYPE,
                                        aligned_data, length - 3,
-                                       FALSE, g_free, NULL);
+                                       FALSE, g_free, aligned_data);
 
   if (!raw_value)
     goto invalid_format;
@@ -1018,7 +1020,7 @@ fp_print_deserialize (const guchar *data,
     value = g_variant_get_normal_form (raw_value);
 
   g_variant_get (value,
-                 "(issbymsmsi@a{sv}v)",
+                 "(i&s&sbymsmsi@a{sv}v)",
                  &type,
                  &driver,
                  &device_id,
@@ -1046,7 +1048,7 @@ fp_print_deserialize (const guchar *data,
       fpi_print_set_type (result, FP_PRINT_NBIS);
       for (i = 0; i < g_variant_n_children (prints); i++)
         {
-          struct xyt_struct *xyt = g_new0 (struct xyt_struct, 1);
+          g_autofree struct xyt_struct *xyt = g_new0 (struct xyt_struct, 1);
           const gint32 *xcol, *ycol, *thetacol;
           gsize xlen, ylen, thetalen;
           g_autoptr(GVariant) xyt_data = NULL;
@@ -1077,7 +1079,7 @@ fp_print_deserialize (const guchar *data,
           memcpy (xyt->ycol, ycol, sizeof (xcol[0]) * xlen);
           memcpy (xyt->thetacol, thetacol, sizeof (xcol[0]) * xlen);
 
-          g_ptr_array_add (result->prints, xyt);
+          g_ptr_array_add (result->prints, g_steal_pointer (&xyt));
         }
     }
   else if (type == FP_PRINT_RAW)

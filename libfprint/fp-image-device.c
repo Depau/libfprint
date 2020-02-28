@@ -21,6 +21,7 @@
 #include "fpi-log.h"
 
 #include "fpi-image-device.h"
+#include "fpi-enums.h"
 #include "fpi-print.h"
 #include "fpi-image.h"
 
@@ -49,7 +50,9 @@ typedef struct
 {
   FpImageDeviceState state;
   gboolean           active;
+  gboolean           cancelling;
 
+  gboolean           enroll_await_on_pending;
   gint               enroll_stage;
 
   guint              pending_activation_timeout_id;
@@ -60,6 +63,21 @@ typedef struct
 
 G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (FpImageDevice, fp_image_device, FP_TYPE_DEVICE)
 
+enum {
+  PROP_0,
+  PROP_FPI_STATE,
+  N_PROPS
+};
+
+static GParamSpec *properties[N_PROPS];
+
+enum {
+  FPI_STATE_CHANGED,
+
+  LAST_SIGNAL
+};
+
+static guint signals[LAST_SIGNAL] = { 0 };
 
 /*******************************************************/
 
@@ -73,27 +91,19 @@ static void
 fp_image_device_change_state (FpImageDevice *self, FpImageDeviceState state)
 {
   FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
-  FpImageDeviceClass *cls = FP_IMAGE_DEVICE_GET_CLASS (self);
 
   /* Cannot change to inactive using this function. */
   g_assert (state != FP_IMAGE_DEVICE_STATE_INACTIVE);
 
   /* We might have been waiting for the finger to go OFF to start the
    * next operation. */
-  if (priv->pending_activation_timeout_id)
-    {
-      g_source_remove (priv->pending_activation_timeout_id);
-      priv->pending_activation_timeout_id = 0;
-    }
+  g_clear_handle_id (&priv->pending_activation_timeout_id, g_source_remove);
 
   fp_dbg ("Image device internal state change from %d to %d\n", priv->state, state);
 
   priv->state = state;
-
-  /* change_state is the only callback which is optional and does not
-   * have a default implementation. */
-  if (cls->change_state)
-    cls->change_state (self, state);
+  g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_FPI_STATE]);
+  g_signal_emit (self, signals[FPI_STATE_CHANGED], 0, priv->state);
 }
 
 static void
@@ -107,14 +117,11 @@ fp_image_device_activate (FpImageDevice *self)
   /* We don't have a neutral ACTIVE state, but we always will
    * go into WAIT_FINGER_ON afterwards. */
   priv->state = FP_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON;
+  g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_FPI_STATE]);
 
   /* We might have been waiting for deactivation to finish before
    * starting the next operation. */
-  if (priv->pending_activation_timeout_id)
-    {
-      g_source_remove (priv->pending_activation_timeout_id);
-      priv->pending_activation_timeout_id = 0;
-    }
+  g_clear_handle_id (&priv->pending_activation_timeout_id, g_source_remove);
 
   fp_dbg ("Activating image device\n");
   cls->activate (self);
@@ -134,7 +141,11 @@ fp_image_device_deactivate (FpDevice *device)
       fp_dbg ("Already deactivated, ignoring request.");
       return;
     }
+  if (!priv->cancelling && priv->state == FP_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON)
+    g_warning ("Deactivating image device while waiting for finger, this should not happen.");
+
   priv->state = FP_IMAGE_DEVICE_STATE_INACTIVE;
+  g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_FPI_STATE]);
 
   fp_dbg ("Deactivating image device\n");
   cls->deactivate (self);
@@ -196,6 +207,7 @@ static void
 fp_image_device_cancel_action (FpDevice *device)
 {
   FpImageDevice *self = FP_IMAGE_DEVICE (device);
+  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
   FpDeviceAction action;
 
   action = fpi_device_get_current_action (device);
@@ -207,7 +219,9 @@ fp_image_device_cancel_action (FpDevice *device)
       action == FP_DEVICE_ACTION_IDENTIFY ||
       action == FP_DEVICE_ACTION_CAPTURE)
     {
+      priv->cancelling = TRUE;
       fp_image_device_deactivate (FP_DEVICE (self));
+      priv->cancelling = FALSE;
 
       /* XXX: Some nicer way of doing this would be good. */
       fpi_device_action_error (FP_DEVICE (self),
@@ -250,6 +264,7 @@ fp_image_device_start_capture_action (FpDevice *device)
     }
 
   priv->enroll_stage = 0;
+  priv->enroll_await_on_pending = FALSE;
 
   /* The device might still be deactivating from a previous call.
    * In that situation, try to wait for a bit before reporting back an
@@ -286,6 +301,7 @@ fp_image_device_finalize (GObject *object)
   FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
 
   g_assert (priv->active == FALSE);
+  g_clear_handle_id (&priv->pending_activation_timeout_id, g_source_remove);
 
   G_OBJECT_CLASS (fp_image_device_parent_class)->finalize (object);
 }
@@ -303,12 +319,33 @@ fp_image_device_default_deactivate (FpImageDevice *self)
 }
 
 static void
+fp_image_device_get_property (GObject    *object,
+                              guint       prop_id,
+                              GValue     *value,
+                              GParamSpec *pspec)
+{
+  FpImageDevice *self = FP_IMAGE_DEVICE (object);
+  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
+
+  switch (prop_id)
+    {
+    case PROP_FPI_STATE:
+      g_value_set_enum (value, priv->state);
+      break;
+
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+    }
+}
+
+static void
 fp_image_device_class_init (FpImageDeviceClass *klass)
 {
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
   FpDeviceClass *fp_device_class = FP_DEVICE_CLASS (klass);
 
   object_class->finalize = fp_image_device_finalize;
+  object_class->get_property = fp_image_device_get_property;
 
   fp_device_class->open = fp_image_device_open;
   fp_device_class->close = fp_image_device_close;
@@ -322,6 +359,24 @@ fp_image_device_class_init (FpImageDeviceClass *klass)
   /* Default implementations */
   klass->activate = fp_image_device_default_activate;
   klass->deactivate = fp_image_device_default_deactivate;
+
+  properties[PROP_FPI_STATE] =
+    g_param_spec_enum ("fp-image-device-state",
+                       "Image Device State",
+                       "Private: The state of the image device",
+                       FP_TYPE_IMAGE_DEVICE_STATE,
+                       FP_IMAGE_DEVICE_STATE_INACTIVE,
+                       G_PARAM_STATIC_STRINGS | G_PARAM_READABLE);
+
+  signals[FPI_STATE_CHANGED] =
+    g_signal_new ("fp-image-device-state-changed",
+                  G_TYPE_FROM_CLASS (object_class),
+                  G_SIGNAL_RUN_FIRST,
+                  G_STRUCT_OFFSET (FpImageDeviceClass, change_state),
+                  NULL, NULL, NULL,
+                  G_TYPE_NONE, 1, FP_TYPE_IMAGE_DEVICE_STATE);
+
+  g_object_class_install_properties (object_class, N_PROPS, properties);
 }
 
 static void
@@ -340,11 +395,27 @@ fp_image_device_init (FpImageDevice *self)
 }
 
 static void
+fp_image_device_enroll_maybe_await_finger_on (FpImageDevice *self)
+{
+  FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
+
+  if (priv->enroll_await_on_pending)
+    {
+      priv->enroll_await_on_pending = FALSE;
+      fp_image_device_change_state (self, FP_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON);
+    }
+  else
+    {
+      priv->enroll_await_on_pending = TRUE;
+    }
+}
+
+static void
 fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data)
 {
   g_autoptr(FpImage) image = FP_IMAGE (source_object);
+  g_autoptr(FpPrint) print = NULL;
   GError *error = NULL;
-  FpPrint *print = NULL;
   FpDevice *device = FP_DEVICE (user_data);
   FpImageDevicePrivate *priv;
   FpDeviceAction action;
@@ -397,12 +468,18 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
           priv->enroll_stage += 1;
         }
 
-      fpi_device_enroll_progress (device, priv->enroll_stage, print, error);
+      fpi_device_enroll_progress (device, priv->enroll_stage,
+                                  g_steal_pointer (&print), error);
 
+      /* Start another scan or deactivate. */
       if (priv->enroll_stage == IMG_ENROLL_STAGES)
         {
           fpi_device_enroll_complete (device, g_object_ref (enroll_print), NULL);
           fp_image_device_deactivate (device);
+        }
+      else
+        {
+          fp_image_device_enroll_maybe_await_finger_on (FP_IMAGE_DEVICE (device));
         }
     }
   else if (action == FP_DEVICE_ACTION_VERIFY)
@@ -416,7 +493,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
       else
         result = FPI_MATCH_ERROR;
 
-      fpi_device_verify_complete (device, result, print, error);
+      fpi_device_verify_complete (device, result, g_steal_pointer (&print), error);
       fp_image_device_deactivate (device);
     }
   else if (action == FP_DEVICE_ACTION_IDENTIFY)
@@ -437,7 +514,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
             }
         }
 
-      fpi_device_identify_complete (device, result, print, error);
+      fpi_device_identify_complete (device, result, g_steal_pointer (&print), error);
       fp_image_device_deactivate (device);
     }
   else
@@ -493,8 +570,6 @@ fpi_image_device_report_finger_status (FpImageDevice *self,
   FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
   FpDeviceAction action;
 
-  action = fpi_device_get_current_action (device);
-
   if (priv->state == FP_IMAGE_DEVICE_STATE_INACTIVE)
     {
       /* Do we really want to always ignore such reports? We could
@@ -527,13 +602,15 @@ fpi_image_device_report_finger_status (FpImageDevice *self,
        *  2. We are still deactivating the device after an action completed
        *  3. We were waiting for finger removal to start the new action
        * Either way, we always end up deactivating except for the enroll case.
-       * XXX: This is not quite correct though, as we assume we need another finger
-       *      scan even though we might be processing the last one (successfully).
+       *
+       * The enroll case is special as AWAIT_FINGER_ON should only happen after
+       * minutiae detection to prevent deactivation (without cancellation)
+       * from the AWAIT_FINGER_ON state.
        */
       if (action != FP_DEVICE_ACTION_ENROLL)
         fp_image_device_deactivate (device);
       else
-        fp_image_device_change_state (self, FP_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON);
+        fp_image_device_enroll_maybe_await_finger_on (self);
     }
 }
 
@@ -741,7 +818,11 @@ fpi_image_device_deactivate_complete (FpImageDevice *self, GError *error)
 
   /* We might be waiting to be able to activate again. */
   if (priv->pending_activation_timeout_id)
-    fp_image_device_activate (self);
+    {
+      g_clear_handle_id (&priv->pending_activation_timeout_id, g_source_remove);
+      priv->pending_activation_timeout_id =
+        g_idle_add ((GSourceFunc) fp_image_device_activate, self);
+    }
 }
 
 /**
@@ -765,6 +846,7 @@ fpi_image_device_open_complete (FpImageDevice *self, GError *error)
   g_debug ("Image device open completed");
 
   priv->state = FP_IMAGE_DEVICE_STATE_INACTIVE;
+  g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_FPI_STATE]);
 
   fpi_device_open_complete (FP_DEVICE (self), error);
 }
@@ -790,6 +872,7 @@ fpi_image_device_close_complete (FpImageDevice *self, GError *error)
   g_return_if_fail (action == FP_DEVICE_ACTION_CLOSE);
 
   priv->state = FP_IMAGE_DEVICE_STATE_INACTIVE;
+  g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_FPI_STATE]);
 
   fpi_device_close_complete (FP_DEVICE (self), error);
 }

@@ -41,7 +41,7 @@
 #include "drivers_api.h"
 #include "elan.h"
 
-unsigned char
+static unsigned char
 elan_get_pixel (struct fpi_frame_asmbl_ctx *ctx,
                 struct fpi_frame *frame, unsigned int x,
                 unsigned int y)
@@ -91,7 +91,7 @@ G_DECLARE_FINAL_TYPE (FpiDeviceElan, fpi_device_elan, FPI, DEVICE_ELAN,
                       FpImageDevice);
 G_DEFINE_TYPE (FpiDeviceElan, fpi_device_elan, FP_TYPE_IMAGE_DEVICE);
 
-int
+static int
 cmp_short (const void *a, const void *b)
 {
   return (int) (*(short *) a - *(short *) b);
@@ -223,6 +223,7 @@ elan_save_img_frame (FpiDeviceElan *elandev)
     {
       fp_dbg
         ("frame darker than background; finger present during calibration?");
+      g_free (frame);
       return -1;
     }
 
@@ -405,7 +406,6 @@ elan_cmd_read (FpiSsm *ssm, FpDevice *dev)
     cancellable = fpi_device_get_cancellable (dev);
 
   fpi_usb_transfer_submit (transfer, self->cmd_timeout, cancellable, elan_cmd_cb, NULL);
-  fpi_usb_transfer_unref (transfer);
 }
 
 static void
@@ -448,7 +448,6 @@ elan_run_cmd (FpiSsm                *ssm,
                            cancellable,
                            elan_cmd_cb,
                            NULL);
-  fpi_usb_transfer_unref (transfer);
 }
 
 enum stop_capture_states {
@@ -478,7 +477,6 @@ stop_capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
 
   G_DEBUG_HERE ();
 
-  fpi_ssm_free (ssm);
 
   /* The device is inactive at this point. */
   self->dev_state = FP_IMAGE_DEVICE_STATE_INACTIVE;
@@ -605,7 +603,6 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
       fpi_image_device_session_error (dev, error);
     }
 
-  fpi_ssm_free (ssm);
 }
 
 static void
@@ -752,15 +749,10 @@ calibrate_run_state (FpiSsm *ssm, FpDevice *dev)
         }
       else
         {
-          GSource *timeout;
-
           if (self->calib_status == 0x00 &&
               self->last_read[0] == 0x01)
             self->calib_status = 0x01;
-          timeout = fpi_device_add_timeout (dev, 50,
-                                            fpi_ssm_next_state_timeout_cb,
-                                            ssm);
-          g_source_set_name (timeout, "calibrate_run_state");
+          fpi_ssm_next_state_delayed (ssm, 50, NULL);
         }
       break;
 
@@ -784,11 +776,9 @@ calibrate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
     }
   else
     {
-      self->dev_state = FP_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON;
       elan_capture (dev);
     }
 
-  fpi_ssm_free (ssm);
 }
 
 static void
@@ -885,7 +875,6 @@ activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   fpi_image_device_activate_complete (idev, error);
 
-  fpi_ssm_free (ssm);
 }
 
 static void
@@ -974,10 +963,9 @@ elan_change_state (FpImageDevice *idev)
 
   switch (next_state)
     {
-      break;
-
     case FP_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON:
       /* activation completed or another enroll stage started */
+      self->dev_state = FP_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON;
       elan_calibrate (dev);
       break;
 
@@ -987,9 +975,8 @@ elan_change_state (FpImageDevice *idev)
 
     case FP_IMAGE_DEVICE_STATE_INACTIVE:
     case FP_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF:
-      if (self->dev_state != FP_IMAGE_DEVICE_STATE_INACTIVE ||
-          self->dev_state != FP_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF)
-        elan_stop_capture (dev);
+      elan_stop_capture (dev);
+      break;
     }
 }
 
@@ -1028,7 +1015,7 @@ dev_change_state (FpImageDevice *dev, FpImageDeviceState state)
         self->dev_state_next = state;
         timeout = fpi_device_add_timeout (FP_DEVICE (dev), 10,
                                           elan_change_state_async,
-                                          NULL);
+                                          NULL, NULL);
 
         name = g_strdup_printf ("dev_change_state to %d", state);
         g_source_set_name (timeout, name);

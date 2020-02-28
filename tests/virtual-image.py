@@ -10,24 +10,19 @@ import sys
 import unittest
 import socket
 import struct
+import subprocess
 import shutil
 import glob
 import cairo
 import tempfile
 
-class Connection:
-
-    def __init__(self, addr):
-        self.addr = addr
-
-    def __enter__(self):
-        self.con = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.con.connect(self.addr)
-        return self.con
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.con.close()
-        del self.con
+# Re-run the test with the passed wrapper if set
+wrapper = os.getenv('LIBFPRINT_TEST_WRAPPER')
+if wrapper:
+    wrap_cmd = wrapper.split(' ') + [sys.executable, os.path.abspath(__file__)] + \
+        sys.argv[1:]
+    os.unsetenv('LIBFPRINT_TEST_WRAPPER')
+    sys.exit(subprocess.check_call(wrap_cmd))
 
 def load_image(img):
     png = cairo.ImageSurface.create_from_png(img)
@@ -92,24 +87,51 @@ class VirtualImage(unittest.TestCase):
     def setUp(self):
         self.dev.open_sync()
 
+        self.con = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.con.connect(self.sockaddr)
+
     def tearDown(self):
+        self.con.close()
+        del self.con
         self.dev.close_sync()
 
-    def report_finger(self, state):
-        with Connection(self.sockaddr) as con:
-            con.write(struct.pack('ii', -1, 1 if state else 0))
+    def send_retry(self, retry_error=1, iterate=True):
+        # The default (1) is too-short
+        self.sendall(struct.pack('ii', -1, retry_error))
+        while iterate and ctx.pending():
+            ctx.iteration(False)
 
-    def send_image(self, image):
+    def send_error(self, device_error=0, iterate=True):
+        # The default (0) is a generic error
+        self.sendall(struct.pack('ii', -1, retry_error))
+        while iterate and ctx.pending():
+            ctx.iteration(False)
+
+    def send_finger_automatic(self, automatic, iterate=True):
+        # Set whether finger on/off is reported around images
+        self.con.sendall(struct.pack('ii', -3, 1 if automatic else 0))
+        while iterate and ctx.pending():
+            ctx.iteration(False)
+
+    def send_finger_report(self, has_finger, iterate=True):
+        # Send finger on/off
+        self.con.sendall(struct.pack('ii', -4, 1 if has_finger else 0))
+        while iterate and ctx.pending():
+            ctx.iteration(False)
+
+    def send_image(self, image, iterate=True):
         img = self.prints[image]
-        with Connection(self.sockaddr) as con:
-            mem = img.get_data()
-            mem = mem.tobytes()
-            assert len(mem) == img.get_width() * img.get_height()
 
-            encoded_img = struct.pack('ii', img.get_width(), img.get_height())
-            encoded_img += mem
+        mem = img.get_data()
+        mem = mem.tobytes()
+        assert len(mem) == img.get_width() * img.get_height()
 
-            con.sendall(encoded_img)
+        encoded_img = struct.pack('ii', img.get_width(), img.get_height())
+        encoded_img += mem
+
+        self.con.sendall(encoded_img)
+        while iterate and ctx.pending():
+            ctx.iteration(False)
 
     def test_capture_prevents_close(self):
         cancel = Gio.Cancellable()
@@ -160,10 +182,16 @@ class VirtualImage(unittest.TestCase):
         while self._step < 1:
             ctx.iteration(True)
 
+        # Test the image-device path where the finger is removed after
+        # the minutiae scan is completed.
+        self.send_finger_automatic(False)
+        self.send_finger_report(True)
         self.send_image(image)
         while self._step < 2:
             ctx.iteration(True)
+        self.send_finger_report(False)
 
+        self.send_finger_automatic(True)
         self.send_image(image)
         while self._step < 3:
             ctx.iteration(True)
@@ -273,7 +301,6 @@ class VirtualImage(unittest.TestCase):
         while self._verify_match is None:
             ctx.iteration(True)
         assert(not self._verify_match)
-
 
 # avoid writing to stderr
 unittest.main(testRunner=unittest.TextTestRunner(stream=sys.stdout, verbosity=2))

@@ -181,9 +181,11 @@ GError * fpi_device_retry_new (FpDeviceRetry error);
 GError * fpi_device_error_new (FpDeviceError error);
 
 GError * fpi_device_retry_new_msg (FpDeviceRetry error,
-                                   const gchar  *msg);
+                                   const gchar  *msg,
+                                   ...) G_GNUC_PRINTF (2, 3);
 GError * fpi_device_error_new_msg (FpDeviceError error,
-                                   const gchar  *msg);
+                                   const gchar  *msg,
+                                   ...) G_GNUC_PRINTF (2, 3);
 
 guint64 fpi_device_get_driver_data (FpDevice *device);
 
@@ -201,11 +203,11 @@ void fpi_device_get_delete_data (FpDevice *device,
 GCancellable *fpi_device_get_cancellable (FpDevice *device);
 
 
-
-GSource * fpi_device_add_timeout (FpDevice     *device,
-                                  gint          interval,
-                                  FpTimeoutFunc func,
-                                  gpointer      user_data);
+GSource * fpi_device_add_timeout (FpDevice      *device,
+                                  gint           interval,
+                                  FpTimeoutFunc  func,
+                                  gpointer       user_data,
+                                  GDestroyNotify destroy_notify);
 
 void fpi_device_set_nr_enroll_stages (FpDevice *device,
                                       gint      enroll_stages);

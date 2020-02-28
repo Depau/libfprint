@@ -1,5 +1,6 @@
 /*
- * Internal/private definitions for libfprint
+ * Example fingerprint device prints listing and deletion
+ * Enrolls your right index finger and saves the print to disk
  * Copyright (C) 2019 Marco Trevisan <marco.trevisan@canonical.com>
  *
  * This library is free software; you can redistribute it and/or
@@ -19,7 +20,16 @@
 
 #pragma once
 
-#include "fpi-log.h"
-#include "fpi-image.h"
-#include "fpi-image-device.h"
-#include "fpi-minutiae.h"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wredundant-decls"
+
+#include <bozorth.h>
+#include <bz_array.h>
+#include <defs.h>
+#include <lfs.h>
+#include <log.h>
+#include <morph.h>
+#include <mytime.h>
+#include <sunrast.h>
+
+#pragma GCC diagnostic pop

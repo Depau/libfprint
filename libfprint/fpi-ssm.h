@@ -2,6 +2,7 @@
  * Copyright (C) 2007-2008 Daniel Drake <dsd@gentoo.org>
  * Copyright (C) 2018 Bastien Nocera <hadess@hadess.net>
  * Copyright (C) 2019 Benjamin Berg <bberg@redhat.com>
+ * Copyright (C) 2019 Marco Trevisan <marco.trevisan@canonical.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -59,9 +60,12 @@ typedef void (*FpiSsmHandlerCallback)(FpiSsm   *ssm,
                                       FpDevice *dev);
 
 /* for library and drivers */
-FpiSsm *fpi_ssm_new (FpDevice             *dev,
-                     FpiSsmHandlerCallback handler,
-                     int                   nr_states);
+#define fpi_ssm_new(dev, handler, nr_states) \
+  fpi_ssm_new_full (dev, handler, nr_states, #nr_states)
+FpiSsm *fpi_ssm_new_full (FpDevice             *dev,
+                          FpiSsmHandlerCallback handler,
+                          int                   nr_states,
+                          const char           *machine_name);
 void fpi_ssm_free (FpiSsm *machine);
 void fpi_ssm_start (FpiSsm                 *ssm,
                     FpiSsmCompletedCallback callback);
@@ -72,7 +76,18 @@ void fpi_ssm_start_subsm (FpiSsm *parent,
 void fpi_ssm_next_state (FpiSsm *machine);
 void fpi_ssm_jump_to_state (FpiSsm *machine,
                             int     state);
+void fpi_ssm_next_state_delayed (FpiSsm       *machine,
+                                 int           delay,
+                                 GCancellable *cancellable);
+void fpi_ssm_jump_to_state_delayed (FpiSsm       *machine,
+                                    int           state,
+                                    int           delay,
+                                    GCancellable *cancellable);
+void fpi_ssm_cancel_delayed_state_change (FpiSsm *machine);
 void fpi_ssm_mark_completed (FpiSsm *machine);
+void fpi_ssm_mark_completed_delayed (FpiSsm       *machine,
+                                     int           delay,
+                                     GCancellable *cancellable);
 void fpi_ssm_mark_failed (FpiSsm *machine,
                           GError *error);
 void fpi_ssm_set_data (FpiSsm        *machine,
@@ -86,9 +101,11 @@ int fpi_ssm_get_cur_state (FpiSsm *machine);
 /* Callbacks to be used by the driver instead of implementing their own
  * logic.
  */
-void fpi_ssm_next_state_timeout_cb (FpDevice *dev,
-                                    void     *data);
 void fpi_ssm_usb_transfer_cb (FpiUsbTransfer *transfer,
                               FpDevice       *device,
-                              gpointer        user_data,
+                              gpointer        unused_data,
                               GError         *error);
+void fpi_ssm_usb_transfer_with_weak_pointer_cb (FpiUsbTransfer *transfer,
+                                                FpDevice       *device,
+                                                gpointer        weak_ptr,
+                                                GError         *error);
